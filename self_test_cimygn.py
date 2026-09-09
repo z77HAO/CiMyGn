@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Small CPU self-test for the CiMyGn model; no study data are required."""
+"""Small CPU self-test for the manuscript-aligned CiMyGn model."""
 
 from __future__ import annotations
 
@@ -16,100 +16,68 @@ def main() -> int:
         "data_dim": data_dim,
         "n_power_modes": 3,
         "n_fc_modes": 4,
-        "gin_hidden": 6,
-        "roi_direct_hidden": 7,
-        "rnn_hidden": 8,
-        "rnn_layers": 1,
-        "static_fc_hidden": 9,
-        "classifier_hidden": 12,
-        "classifier_input": "fused",
-        "dropout": 0.0,
         "num_classes": 2,
-        "min_scale": 1e-3,
-        "min_cholesky": 1e-3,
-        "covariance_jitter": 1e-4,
-        "free_bits": 0.02,
-        "prior_separation_margin": 0.5,
-        "coefficient_temperature": 0.75,
+        "encoder_hidden": 8,
+        "encoder_layers": 2,
+        "encoder_dropout": 0.0,
+        "prior_hidden": 8,
+        "classifier_hidden": 12,
+        "classifier_dropout": 0.0,
+        "tau_power": 1.0,
+        "tau_fc": 1.0,
+        "min_scale": 1e-4,
+        "min_cholesky": 1e-4,
+        "covariance_jitter": 1e-5,
     }
-    orthogonal, _ = torch.linalg.qr(torch.randn(data_dim, data_dim))
-    model = CiMyGn(config, orthogonal)
+    rotation, _ = torch.linalg.qr(torch.randn(data_dim, data_dim))
+    model = CiMyGn(config, rotation)
     x = torch.randn(batch_size, timepoints, data_dim)
-    adjacency = torch.randn(batch_size, data_dim, data_dim)
-    adjacency = 0.5 * (adjacency + adjacency.transpose(-1, -2))
-    adjacency.diagonal(dim1=-2, dim2=-1).zero_()
-    degree = adjacency.abs().sum(dim=-1).clamp_min(1e-6)
-    adjacency = (
-        degree.rsqrt().unsqueeze(-1)
-        * adjacency
-        * degree.rsqrt().unsqueeze(-2)
-    )
     labels = torch.tensor([0, 1, 1])
 
     model.train()
     outputs = model(
         x,
-        adjacency,
         labels=labels,
         sample_latent=True,
         compute_nll=True,
-        nll_time_samples=6,
+        nll_chunk_size=4,
     )
-    loss, weights = model.total_loss(
-        outputs,
-        epoch=3,
-        nll_weight=0.25,
-        kl_max_weight=0.02,
-        classification_weight=1.0,
-        mode_classification_weight=0.25,
-        classification_warmup_epochs=1,
-        generative_ramp_epochs=2,
-        prior_separation_weight=0.01,
-        mode_diversity_weight=0.01,
-        occupancy_entropy_weight=0.002,
-        occupancy_balance_weight=0.01,
-    )
+    loss = model.total_loss(outputs, lambda_kl=0.5, gamma_cls=1.0)
     if not torch.isfinite(loss):
         raise AssertionError("Training loss is not finite.")
     loss.backward()
-    finite_gradients = [
-        torch.isfinite(parameter.grad).all()
+    gradients = [
+        parameter.grad
         for parameter in model.parameters()
-        if parameter.grad is not None
+        if parameter.requires_grad and parameter.grad is not None
     ]
-    if not finite_gradients or not all(bool(value) for value in finite_gradients):
+    if not gradients or not all(bool(torch.isfinite(g).all()) for g in gradients):
         raise AssertionError("A model gradient is missing or non-finite.")
-    if weights["generative_fraction"] != 1.0:
-        raise AssertionError("The staged loss schedule did not reach full weight.")
 
-    correlations = model.fc_correlation_modes().detach()
+    power_scale = model.power_scale_templates().detach()
+    if float(power_scale.min()) <= 0.0:
+        raise AssertionError("Regional-scale templates are not strictly positive.")
+
+    correlations = model.fc_correlation_templates().detach()
     if not torch.allclose(
         correlations, correlations.transpose(-1, -2), atol=1e-6
     ):
-        raise AssertionError("FC modes are not symmetric.")
+        raise AssertionError("FC templates are not symmetric.")
+    diagonal = torch.diagonal(correlations, dim1=-2, dim2=-1)
+    if not torch.allclose(diagonal, torch.ones_like(diagonal), atol=1e-5):
+        raise AssertionError("FC templates do not have unit diagonal.")
     if float(torch.linalg.eigvalsh(correlations).min()) <= 0.0:
-        raise AssertionError("An FC correlation mode is not positive definite.")
+        raise AssertionError("An FC template is not positive definite.")
 
     model.eval()
     with torch.no_grad():
-        first = model(
-            x,
-            adjacency,
-            labels=None,
-            sample_latent=False,
-            compute_nll=False,
-        )
-        second = model(
-            x,
-            adjacency,
-            labels=None,
-            sample_latent=False,
-            compute_nll=False,
-        )
+        first = model(x, labels=None, sample_latent=False, compute_nll=False)
+        second = model(x, labels=None, sample_latent=False, compute_nll=False)
+
     if first["kl"] is not None or first["classification_loss"] is not None:
-        raise AssertionError("Unlabelled inference unexpectedly computed labelled losses.")
+        raise AssertionError("Unlabelled inference computed labelled losses.")
     if not torch.equal(first["logits"], second["logits"]):
-        raise AssertionError("Deterministic evaluation produced different logits.")
+        raise AssertionError("Deterministic inference produced different logits.")
     if not torch.allclose(
         first["power_coefficients"].sum(dim=-1),
         torch.ones(batch_size, timepoints),
@@ -122,12 +90,10 @@ def main() -> int:
         atol=1e-6,
     ):
         raise AssertionError("FC coefficients do not sum to one.")
-    if first["encoder_subject_features"].shape != (batch_size, 48):
-        raise AssertionError("Unexpected ROI-aware encoder feature shape.")
-    if first["static_fc_embedding"].shape != (batch_size, 9):
-        raise AssertionError("Unexpected static-FC embedding shape.")
+    if first["prior_power_mean"] is not None or first["prior_fc_mean"] is not None:
+        raise AssertionError("Class-guided prior was evaluated without labels.")
 
-    print("CiMyGn self-test: PASS")
+    print("CiMyGn manuscript-aligned self-test: PASS")
     print(f"torch={torch.__version__}; loss={float(loss.detach()):.6f}")
     return 0
 

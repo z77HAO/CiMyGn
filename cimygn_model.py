@@ -1,6 +1,22 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""ROI-aware, numerically stable CiMyGn V2 for resting-state fMRI."""
+"""CiMyGn model aligned with the method described in the manuscript.
+
+The implementation follows the manuscript at the level explicitly specified there:
+- a two-layer BiLSTM inference encoder;
+- separate diagonal-Gaussian posterior heads for regional-scale and FC logits;
+- one class-guided recurrent prior with a shared recurrent state and separate
+  output parameterizations for the two branches;
+- temperature-softmax mode-expression weights;
+- positive diagonal regional-scale templates and SPD/unit-diagonal FC templates;
+- zero-mean Gaussian observation model with C_t = G_t F_t G_t;
+- a subject-level MLP classifier derived from the inferred latent trajectories;
+- training loss: NLL + lambda_KL * KL + gamma_cls * CE.
+
+The manuscript does not specify every low-level engineering choice (for example,
+the exact KL-annealing schedule or tensor-reduction convention). Those choices are
+implemented in cimygn_engine.py and are kept explicit there.
+"""
 
 from __future__ import annotations
 
@@ -12,538 +28,430 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def inverse_softplus(value: float) -> float:
+def _inverse_softplus(value: float) -> float:
+    value = max(float(value), 1e-8)
     return math.log(math.expm1(value))
 
 
-def gaussian_kl(
+def diagonal_gaussian_kl(
     mean_q: torch.Tensor,
     logvar_q: torch.Tensor,
     mean_p: torch.Tensor,
     logvar_p: torch.Tensor,
-    free_bits: float = 0.0,
 ) -> torch.Tensor:
-    """Mean Gaussian KL, optionally with free bits applied per latent unit."""
-    logvar_q = torch.clamp(logvar_q, -8.0, 8.0)
-    logvar_p = torch.clamp(logvar_p, -8.0, 8.0)
-    var_ratio = torch.exp(logvar_q - logvar_p)
+    """KL[q||p] for diagonal Gaussians, summed over latent dimensions.
+
+    Returns a tensor with the latent dimension removed, e.g. [B, T].
+    """
+    logvar_q = torch.clamp(logvar_q, -12.0, 12.0)
+    logvar_p = torch.clamp(logvar_p, -12.0, 12.0)
+    variance_ratio = torch.exp(logvar_q - logvar_p)
     mean_term = (mean_q - mean_p).square() * torch.exp(-logvar_p)
-    elementwise = 0.5 * (var_ratio + mean_term + logvar_p - logvar_q - 1.0)
-    reduce_dims = tuple(range(elementwise.ndim - 1))
-    per_latent = elementwise.mean(dim=reduce_dims)
-    if free_bits > 0.0:
-        per_latent = torch.clamp(per_latent, min=free_bits)
-    return per_latent.mean()
+    elementwise = 0.5 * (
+        variance_ratio + mean_term + logvar_p - logvar_q - 1.0
+    )
+    return elementwise.sum(dim=-1)
 
 
-class GaussianPosterior(nn.Module):
-    def __init__(self, hidden_dim: int, latent_dim: int):
+class BiLSTMInferenceEncoder(nn.Module):
+    """Bidirectional LSTM inference encoder q_psi(Theta_1:T | x_1:T)."""
+
+    def __init__(
+        self,
+        data_dim: int,
+        hidden_dim: int = 128,
+        num_layers: int = 2,
+        dropout: float = 0.2,
+    ) -> None:
         super().__init__()
-        self.to_mean = nn.Linear(hidden_dim, latent_dim)
-        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
+        self.data_dim = int(data_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_layers = int(num_layers)
+        self.rnn = nn.LSTM(
+            input_size=self.data_dim,
+            hidden_size=self.hidden_dim,
+            num_layers=self.num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=float(dropout) if self.num_layers > 1 else 0.0,
+        )
+        self.output_norm = nn.LayerNorm(2 * self.hidden_dim)
 
-    def forward(self, hidden: torch.Tensor, sample: bool):
-        mean = self.to_mean(hidden)
-        logvar = torch.clamp(self.to_logvar(hidden), -8.0, 8.0)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 3 or x.shape[-1] != self.data_dim:
+            raise ValueError(
+                f"Expected x with shape [B,T,{self.data_dim}], received {tuple(x.shape)}."
+            )
+        hidden, _ = self.rnn(x)
+        return self.output_norm(hidden)
+
+
+class GaussianPosteriorHead(nn.Module):
+    """Diagonal-Gaussian posterior head for one latent branch."""
+
+    def __init__(self, input_dim: int, latent_dim: int) -> None:
+        super().__init__()
+        self.mean = nn.Linear(input_dim, latent_dim)
+        self.logvar = nn.Linear(input_dim, latent_dim)
+
+    def forward(
+        self, hidden: torch.Tensor, sample: bool
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean = self.mean(hidden)
+        logvar = torch.clamp(self.logvar(hidden), -10.0, 10.0)
         if sample:
-            latent = mean + torch.exp(0.5 * logvar) * torch.randn_like(mean)
+            eps = torch.randn_like(mean)
+            latent = mean + torch.exp(0.5 * logvar) * eps
         else:
             latent = mean
         return latent, mean, logvar
 
 
-class ClassAutoregressivePrior(nn.Module):
-    """Product of autoregressive and class-conditional Gaussian experts."""
+class ClassGuidedSharedRecurrentPrior(nn.Module):
+    """Diagnosis-conditioned recurrent prior with one shared recurrent state.
+
+    The manuscript states that the power and FC branches retain separate prior
+    parameterizations while being coupled through a shared recurrent state. This
+    implementation realizes that statement by feeding the shifted joint latent
+    history and one-hot class label into one unidirectional LSTM, followed by
+    branch-specific Gaussian output heads.
+    """
 
     def __init__(
         self,
-        latent_dim: int,
-        hidden_dim: int,
-        num_classes: int,
-        rnn_layers: int = 1,
-    ):
+        power_dim: int,
+        fc_dim: int,
+        hidden_dim: int = 128,
+        num_classes: int = 2,
+    ) -> None:
         super().__init__()
+        self.power_dim = int(power_dim)
+        self.fc_dim = int(fc_dim)
+        self.joint_dim = self.power_dim + self.fc_dim
+        self.hidden_dim = int(hidden_dim)
+        self.num_classes = int(num_classes)
+
         self.rnn = nn.LSTM(
-            latent_dim,
-            hidden_dim,
-            num_layers=rnn_layers,
+            input_size=self.joint_dim + self.num_classes,
+            hidden_size=self.hidden_dim,
+            num_layers=1,
             batch_first=True,
         )
-        self.to_mean = nn.Linear(hidden_dim, latent_dim)
-        self.to_logvar = nn.Linear(hidden_dim, latent_dim)
-        self.class_mean = nn.Parameter(torch.empty(num_classes, latent_dim))
-        self.class_logvar = nn.Parameter(torch.zeros(num_classes, latent_dim))
-        self.initial_h = nn.Parameter(torch.zeros(rnn_layers, 1, hidden_dim))
-        self.initial_c = nn.Parameter(torch.zeros(rnn_layers, 1, hidden_dim))
-        self.norm = nn.LayerNorm(hidden_dim)
-        with torch.no_grad():
-            nn.init.normal_(self.class_mean, mean=0.0, std=0.04)
-            self.class_mean.sub_(self.class_mean.mean(dim=0, keepdim=True))
+        self.norm = nn.LayerNorm(self.hidden_dim)
 
-    def forward(self, latent_context: torch.Tensor, labels: torch.Tensor):
-        batch_size = latent_context.shape[0]
-        shifted = torch.cat(
-            [torch.zeros_like(latent_context[:, :1]), latent_context[:, :-1]], dim=1
-        )
-        h0 = self.initial_h.expand(-1, batch_size, -1).contiguous()
-        c0 = self.initial_c.expand(-1, batch_size, -1).contiguous()
-        ar_hidden, _ = self.rnn(shifted, (h0, c0))
-        ar_hidden = self.norm(ar_hidden)
-        mean_ar = self.to_mean(ar_hidden)
-        logvar_ar = torch.clamp(self.to_logvar(ar_hidden), -8.0, 8.0)
+        self.power_mean = nn.Linear(self.hidden_dim, self.power_dim)
+        self.power_logvar = nn.Linear(self.hidden_dim, self.power_dim)
+        self.fc_mean = nn.Linear(self.hidden_dim, self.fc_dim)
+        self.fc_logvar = nn.Linear(self.hidden_dim, self.fc_dim)
 
-        mean_class = self.class_mean[labels].unsqueeze(1).expand_as(mean_ar)
-        logvar_class = (
-            torch.clamp(self.class_logvar[labels], -8.0, 8.0)
-            .unsqueeze(1)
-            .expand_as(logvar_ar)
-        )
-        precision_ar = torch.exp(-logvar_ar)
-        precision_class = torch.exp(-logvar_class)
-        precision = precision_ar + precision_class
-        variance = torch.reciprocal(precision)
-        mean = variance * (precision_ar * mean_ar + precision_class * mean_class)
-        return mean, torch.log(variance)
+    def forward(
+        self,
+        sampled_power: torch.Tensor,
+        sampled_fc: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        if labels is None:
+            raise ValueError("The class-guided prior requires labels during training.")
+        joint = torch.cat([sampled_power, sampled_fc], dim=-1)
+        shifted = torch.cat([torch.zeros_like(joint[:, :1]), joint[:, :-1]], dim=1)
+        one_hot = F.one_hot(labels.long(), num_classes=self.num_classes).to(joint.dtype)
+        one_hot = one_hot.unsqueeze(1).expand(-1, joint.shape[1], -1)
+        prior_input = torch.cat([shifted, one_hot], dim=-1)
+        recurrent, _ = self.rnn(prior_input)
+        recurrent = self.norm(recurrent)
+
+        power_mean = self.power_mean(recurrent)
+        power_logvar = torch.clamp(self.power_logvar(recurrent), -10.0, 10.0)
+        fc_mean = self.fc_mean(recurrent)
+        fc_logvar = torch.clamp(self.fc_logvar(recurrent), -10.0, 10.0)
+        return power_mean, power_logvar, fc_mean, fc_logvar
 
 
 class CiMyGn(nn.Module):
-    """Class-informed multi-dynamic graph network with ROI-aware fusion."""
+    """Class-Guided Multi-dynamics Generative network."""
 
-    def __init__(self, config: Dict, pca_rotation: torch.Tensor):
+    def __init__(self, config: Dict, pca_rotation: torch.Tensor) -> None:
         super().__init__()
         self.config = dict(config)
         self.data_dim = int(config["data_dim"])
-        self.n_power_modes = int(config["n_power_modes"])
-        self.n_fc_modes = int(config["n_fc_modes"])
-        self.min_scale = float(config.get("min_scale", 1e-3))
-        self.min_cholesky = float(config.get("min_cholesky", 1e-3))
-        self.covariance_jitter = float(config.get("covariance_jitter", 1e-4))
-        self.free_bits = float(config.get("free_bits", 0.02))
-        self.prior_separation_margin = float(
-            config.get("prior_separation_margin", 0.5)
-        )
-        self.coefficient_temperature = float(
-            config.get("coefficient_temperature", 0.75)
-        )
-        self.classifier_input = str(config.get("classifier_input", "fused"))
-        self.register_buffer("pca_rotation", pca_rotation.float())
+        self.n_power_modes = int(config.get("n_power_modes", 3))
+        self.n_fc_modes = int(config.get("n_fc_modes", 6))
+        self.num_classes = int(config.get("num_classes", 2))
 
-        rnn_hidden = int(config["rnn_hidden"])
-        self.encoder = GraphTemporalEncoder(
+        encoder_hidden = int(config.get("encoder_hidden", 128))
+        encoder_layers = int(config.get("encoder_layers", 2))
+        encoder_dropout = float(config.get("encoder_dropout", 0.2))
+        prior_hidden = int(config.get("prior_hidden", 128))
+        classifier_hidden = int(config.get("classifier_hidden", 256))
+        classifier_dropout = float(config.get("classifier_dropout", 0.5))
+        self.tau_power = float(config.get("tau_power", 1.0))
+        self.tau_fc = float(config.get("tau_fc", 1.0))
+        self.min_scale = float(config.get("min_scale", 1e-4))
+        self.min_cholesky = float(config.get("min_cholesky", 1e-4))
+        self.covariance_jitter = float(config.get("covariance_jitter", 1e-5))
+
+        if self.tau_power <= 0.0 or self.tau_fc <= 0.0:
+            raise ValueError("Softmax temperatures must be positive.")
+
+        rotation = torch.as_tensor(pca_rotation, dtype=torch.float32)
+        if rotation.shape != (self.data_dim, self.data_dim):
+            raise ValueError(
+                "pca_rotation must be square with shape "
+                f"({self.data_dim},{self.data_dim}); received {tuple(rotation.shape)}."
+            )
+        self.register_buffer("pca_rotation", rotation)
+
+        self.encoder = BiLSTMInferenceEncoder(
             data_dim=self.data_dim,
-            gin_hidden=int(config["gin_hidden"]),
-            roi_direct_hidden=int(config["roi_direct_hidden"]),
-            rnn_hidden=rnn_hidden,
-            rnn_layers=int(config["rnn_layers"]),
-            dropout=float(config["dropout"]),
+            hidden_dim=encoder_hidden,
+            num_layers=encoder_layers,
+            dropout=encoder_dropout,
         )
-        posterior_hidden = 2 * rnn_hidden
-        self.power_posterior = GaussianPosterior(posterior_hidden, self.n_power_modes)
-        self.fc_posterior = GaussianPosterior(posterior_hidden, self.n_fc_modes)
-        self.power_prior = ClassAutoregressivePrior(
-            self.n_power_modes, rnn_hidden, int(config["num_classes"])
+        posterior_input = 2 * encoder_hidden
+        self.power_posterior = GaussianPosteriorHead(
+            posterior_input, self.n_power_modes
         )
-        self.fc_prior = ClassAutoregressivePrior(
-            self.n_fc_modes, rnn_hidden, int(config["num_classes"])
+        self.fc_posterior = GaussianPosteriorHead(posterior_input, self.n_fc_modes)
+
+        self.prior = ClassGuidedSharedRecurrentPrior(
+            power_dim=self.n_power_modes,
+            fc_dim=self.n_fc_modes,
+            hidden_dim=prior_hidden,
+            num_classes=self.num_classes,
         )
 
-        scale_center = inverse_softplus(max(1.0 - self.min_scale, 1e-4))
-        self.power_means = nn.Parameter(
-            0.02 * torch.randn(self.n_power_modes, self.data_dim)
-        )
+        # E_k: positive diagonal regional-scale templates (standard deviations).
+        init_scale = _inverse_softplus(1.0 - self.min_scale)
         self.power_scale_raw = nn.Parameter(
-            scale_center + 0.02 * torch.randn(self.n_power_modes, self.data_dim)
+            init_scale
+            + 0.02 * torch.randn(self.n_power_modes, self.data_dim)
         )
-        raw_tril = 0.01 * torch.tril(
+
+        # R_q: SPD, unit-diagonal FC templates via Cholesky + normalization.
+        raw = 0.01 * torch.tril(
             torch.randn(self.n_fc_modes, self.data_dim, self.data_dim), diagonal=-1
         )
-        diagonal_raw = inverse_softplus(max(1.0 - self.min_cholesky, 1e-4))
+        diag_raw = _inverse_softplus(1.0 - self.min_cholesky)
         diagonal = torch.arange(self.data_dim)
-        raw_tril[:, diagonal, diagonal] = diagonal_raw
-        self.fc_cholesky_raw = nn.Parameter(raw_tril)
+        raw[:, diagonal, diagonal] = diag_raw
+        self.fc_cholesky_raw = nn.Parameter(raw)
 
-        dynamic_dim = (
-            3 * (self.n_power_modes + self.n_fc_modes)
-            + self.n_power_modes**2
-            + self.n_fc_modes**2
-            + 2
+        # Subject-level representation derived from inferred power/FC trajectories.
+        # The manuscript does not specify the pooling operator; temporal mean pooling
+        # is used here as the minimal parameter-free realization.
+        classifier_input_dim = self.n_power_modes + self.n_fc_modes
+        self.classifier = nn.Sequential(
+            nn.LayerNorm(classifier_input_dim),
+            nn.Linear(classifier_input_dim, classifier_hidden),
+            nn.GELU(),
+            nn.Dropout(classifier_dropout),
+            nn.Linear(classifier_hidden, self.num_classes),
         )
-        encoder_dim = 6 * rnn_hidden
-        static_hidden = int(config["static_fc_hidden"])
-        self.static_fc_encoder = StaticFCEncoder(
-            self.data_dim, static_hidden, float(config["dropout"])
-        )
-        input_dimensions = {
-            "fused": dynamic_dim + encoder_dim + static_hidden,
-            "modes-only": dynamic_dim,
-            "encoder-only": encoder_dim,
-            "static-only": static_hidden,
-        }
-        if self.classifier_input not in input_dimensions:
-            raise ValueError(
-                f"Unknown classifier_input={self.classifier_input!r}; "
-                f"choose one of {sorted(input_dimensions)}."
-            )
-        classifier_hidden = int(config["classifier_hidden"])
-        dropout = float(config["dropout"])
 
-        def make_classifier(input_dim: int) -> nn.Sequential:
-            return nn.Sequential(
-                nn.LayerNorm(input_dim),
-                nn.Linear(input_dim, classifier_hidden),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(classifier_hidden, int(config["num_classes"])),
-            )
-
-        self.classifier = make_classifier(input_dimensions[self.classifier_input])
-        self.mode_classifier = make_classifier(dynamic_dim)
-
-    def positive_power_scales(self) -> torch.Tensor:
+    def power_scale_templates(self) -> torch.Tensor:
+        """Return diag(E_k), i.e. positive regional standard-deviation templates."""
         return F.softplus(self.power_scale_raw) + self.min_scale
 
-    def fc_correlation_modes(self) -> torch.Tensor:
+    def power_variance_templates(self) -> torch.Tensor:
+        """Return v_k = diag(E_k)^2 from manuscript Eq. (13)."""
+        return self.power_scale_templates().square()
+
+    def fc_correlation_templates(self) -> torch.Tensor:
+        """Return SPD unit-diagonal FC templates R_q."""
         lower = torch.tril(self.fc_cholesky_raw, diagonal=-1)
         diagonal = F.softplus(
             torch.diagonal(self.fc_cholesky_raw, dim1=-2, dim2=-1)
         ) + self.min_cholesky
         cholesky = lower + torch.diag_embed(diagonal)
         covariance = cholesky @ cholesky.transpose(-1, -2)
-        standard_deviation = torch.sqrt(
-            torch.diagonal(covariance, dim1=-2, dim2=-1).clamp_min(1e-8)
+        sd = torch.sqrt(
+            torch.diagonal(covariance, dim1=-2, dim2=-1).clamp_min(1e-12)
         )
-        correlation = covariance / (
-            standard_deviation.unsqueeze(-1) * standard_deviation.unsqueeze(-2)
-        )
-        return 0.5 * (correlation + correlation.transpose(-1, -2))
+        correlation = covariance / (sd.unsqueeze(-1) * sd.unsqueeze(-2))
+        correlation = 0.5 * (correlation + correlation.transpose(-1, -2))
+        return correlation
 
     @staticmethod
-    def temporal_summary(coefficients: torch.Tensor) -> torch.Tensor:
-        mean = coefficients.mean(dim=1)
-        standard_deviation = coefficients.std(dim=1, unbiased=False)
-        if coefficients.shape[1] > 1:
-            mean_absolute_difference = coefficients.diff(dim=1).abs().mean(dim=1)
-        else:
-            mean_absolute_difference = torch.zeros_like(mean)
-        return torch.cat([mean, standard_deviation, mean_absolute_difference], dim=-1)
-
-    @staticmethod
-    def transition_summary(coefficients: torch.Tensor) -> torch.Tensor:
-        batch_size, n_timepoints, n_modes = coefficients.shape
-        if n_timepoints <= 1:
-            return coefficients.new_zeros((batch_size, n_modes * n_modes))
-        transition = torch.einsum(
-            "bti,btj->bij", coefficients[:, :-1], coefficients[:, 1:]
-        ) / (n_timepoints - 1)
-        return transition.reshape(batch_size, n_modes * n_modes)
-
-    def classification_features(
-        self, power_coefficients: torch.Tensor, fc_coefficients: torch.Tensor
+    def _trajectory_summary(
+        power_mean: torch.Tensor, fc_mean: torch.Tensor
     ) -> torch.Tensor:
-        eps = 1e-8
-        power_entropy = -(
-            power_coefficients.clamp_min(eps)
-            * power_coefficients.clamp_min(eps).log()
-        ).sum(dim=-1).mean(dim=1, keepdim=True)
-        fc_entropy = -(
-            fc_coefficients.clamp_min(eps) * fc_coefficients.clamp_min(eps).log()
-        ).sum(dim=-1).mean(dim=1, keepdim=True)
         return torch.cat(
-            [
-                self.temporal_summary(power_coefficients),
-                self.temporal_summary(fc_coefficients),
-                self.transition_summary(power_coefficients),
-                self.transition_summary(fc_coefficients),
-                power_entropy,
-                fc_entropy,
-            ],
+            [power_mean.mean(dim=1), fc_mean.mean(dim=1)],
             dim=-1,
         )
 
-    @staticmethod
-    def _cosine_diversity_penalty(signatures: torch.Tensor) -> torch.Tensor:
-        if signatures.shape[0] <= 1:
-            return signatures.new_zeros(())
-        signatures = signatures - signatures.mean(dim=-1, keepdim=True)
-        signatures = F.normalize(signatures, dim=-1, eps=1e-6)
-        gram = signatures @ signatures.transpose(-1, -2)
-        mask = ~torch.eye(
-            signatures.shape[0], dtype=torch.bool, device=signatures.device
-        )
-        return gram[mask].square().mean()
-
-    def mode_diversity_penalty(self) -> torch.Tensor:
-        power_signature = torch.cat(
-            [self.power_means, torch.log(self.positive_power_scales())], dim=-1
-        )
-        correlation = self.fc_correlation_modes()
-        row, column = torch.triu_indices(
-            self.data_dim, self.data_dim, offset=1, device=correlation.device
-        )
-        fc_signature = correlation[:, row, column]
-        return self._cosine_diversity_penalty(
-            power_signature
-        ) + self._cosine_diversity_penalty(fc_signature)
-
-    def prior_separation_penalty(self) -> torch.Tensor:
-        penalties = []
-        for prior in (self.power_prior, self.fc_prior):
-            distances = torch.pdist(prior.class_mean, p=2)
-            if distances.numel():
-                penalties.append(
-                    F.relu(self.prior_separation_margin - distances).mean()
-                )
-        if not penalties:
-            return self.power_means.new_zeros(())
-        return torch.stack(penalties).mean()
-
-    @staticmethod
-    def occupancy_regularizers(
-        power: torch.Tensor, fc: torch.Tensor
+    def mode_weights(
+        self, power_logits: torch.Tensor, fc_logits: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        entropies = []
-        balance = []
-        for coefficients in (power, fc):
-            n_modes = coefficients.shape[-1]
-            entropy = -(
-                coefficients.clamp_min(1e-8)
-                * coefficients.clamp_min(1e-8).log()
-            ).sum(dim=-1)
-            entropies.append(entropy.mean() / math.log(n_modes))
-            average = coefficients.mean(dim=(0, 1))
-            target = torch.full_like(average, 1.0 / n_modes)
-            balance.append(n_modes * (average - target).square().sum())
-        return torch.stack(entropies).mean(), torch.stack(balance).mean()
+        alpha = F.softmax(power_logits / self.tau_power, dim=-1)
+        beta = F.softmax(fc_logits / self.tau_fc, dim=-1)
+        return alpha, beta
 
-    def gaussian_nll(
+    def _negative_log_likelihood(
         self,
         x: torch.Tensor,
-        power_coefficients: torch.Tensor,
-        fc_coefficients: torch.Tensor,
-        n_time_samples: int,
+        alpha: torch.Tensor,
+        beta: torch.Tensor,
+        chunk_size: int = 16,
     ) -> torch.Tensor:
-        _, n_timepoints, n_channels = x.shape
-        if n_time_samples > 0 and n_time_samples < n_timepoints:
-            time_index = torch.randperm(n_timepoints, device=x.device)[:n_time_samples]
-            x = x.index_select(1, time_index)
-            power_coefficients = power_coefficients.index_select(1, time_index)
-            fc_coefficients = fc_coefficients.index_select(1, time_index)
+        """Zero-mean Gaussian NLL under C_t = G_t F_t G_t.
 
-        x_pca = x @ self.pca_rotation
-        mean = torch.einsum("btk,kd->btd", power_coefficients, self.power_means)
-        scale = torch.einsum(
-            "btk,kd->btd", power_coefficients, self.positive_power_scales()
-        )
-        correlation = torch.einsum(
-            "btq,qij->btij", fc_coefficients, self.fc_correlation_modes()
-        )
-        covariance = scale.unsqueeze(-1) * correlation * scale.unsqueeze(-2)
-        identity = torch.eye(n_channels, device=x.device, dtype=x.dtype)
+        All time points are used. ``chunk_size`` only controls memory use; it does
+        not subsample the sequence. The returned value is averaged over subjects,
+        time points, and ROIs for stable optimization.
+        """
+        batch_size, n_timepoints, n_channels = x.shape
+        if n_channels != self.data_dim:
+            raise ValueError("Unexpected ROI dimension in likelihood evaluation.")
+        chunk_size = n_timepoints if chunk_size <= 0 else int(chunk_size)
 
-        jitter = self.covariance_jitter
-        cholesky = None
-        last_info = None
-        for _ in range(6):
-            candidate, info = torch.linalg.cholesky_ex(
-                covariance + jitter * identity
+        scale_templates = self.power_scale_templates()
+        fc_templates = self.fc_correlation_templates()
+        rotation = self.pca_rotation.to(dtype=x.dtype)
+        identity = torch.eye(n_channels, dtype=x.dtype, device=x.device)
+        constant = n_channels * math.log(2.0 * math.pi)
+
+        total = x.new_zeros(())
+        count = 0
+        for start in range(0, n_timepoints, chunk_size):
+            stop = min(start + chunk_size, n_timepoints)
+            x_chunk = x[:, start:stop]
+            alpha_chunk = alpha[:, start:stop]
+            beta_chunk = beta[:, start:stop]
+
+            g = torch.einsum("btk,kd->btd", alpha_chunk, scale_templates)
+            f = torch.einsum("btq,qde->btde", beta_chunk, fc_templates)
+            covariance = g.unsqueeze(-1) * f * g.unsqueeze(-2)
+
+            # Fixed full-rank PCA rotation used only for Gaussian-likelihood
+            # evaluation: x' = xR and C' = R^T C R.
+            x_rot = x_chunk @ rotation
+            covariance_rot = torch.einsum(
+                "di,btde,ej->btij", rotation, covariance, rotation
             )
-            if bool(torch.all(info == 0)):
-                cholesky = candidate
-                break
-            last_info = info
-            jitter *= 10.0
-        if cholesky is None:
-            failed = int((last_info != 0).sum().item()) if last_info is not None else -1
-            raise RuntimeError(
-                f"Cholesky decomposition failed for {failed} covariance matrices "
-                "after bounded jitter escalation."
+            covariance_rot = 0.5 * (
+                covariance_rot + covariance_rot.transpose(-1, -2)
             )
 
-        residual = (x_pca - mean).unsqueeze(-1)
-        solution = torch.cholesky_solve(residual, cholesky)
-        mahalanobis = (residual.transpose(-1, -2) @ solution).squeeze(-1).squeeze(-1)
-        log_determinant = 2.0 * torch.log(
-            torch.diagonal(cholesky, dim1=-2, dim2=-1)
-        ).sum(dim=-1)
-        nll = 0.5 * (
-            mahalanobis + log_determinant + n_channels * math.log(2.0 * math.pi)
-        )
-        return (nll / n_channels).mean()
+            jitter = self.covariance_jitter
+            cholesky = None
+            info = None
+            for _ in range(7):
+                candidate, info = torch.linalg.cholesky_ex(
+                    covariance_rot + jitter * identity
+                )
+                if bool(torch.all(info == 0)):
+                    cholesky = candidate
+                    break
+                jitter *= 10.0
+            if cholesky is None:
+                failed = int((info != 0).sum().item()) if info is not None else -1
+                raise RuntimeError(
+                    f"Cholesky decomposition failed for {failed} covariance matrices."
+                )
+
+            residual = x_rot.unsqueeze(-1)
+            solved = torch.cholesky_solve(residual, cholesky)
+            mahalanobis = (
+                residual.transpose(-1, -2) @ solved
+            ).squeeze(-1).squeeze(-1)
+            logdet = 2.0 * torch.log(
+                torch.diagonal(cholesky, dim1=-2, dim2=-1)
+            ).sum(dim=-1)
+            nll = 0.5 * (mahalanobis + logdet + constant)
+            total = total + nll.sum()
+            count += batch_size * (stop - start)
+
+        return total / max(count * n_channels, 1)
 
     def forward(
         self,
         x: torch.Tensor,
-        adjacency: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
         sample_latent: Optional[bool] = None,
         compute_nll: bool = True,
-        nll_time_samples: int = 0,
-        class_weights: Optional[torch.Tensor] = None,
-        compute_regularizers: Optional[bool] = None,
+        nll_chunk_size: int = 16,
     ) -> Dict[str, Optional[torch.Tensor]]:
         if sample_latent is None:
             sample_latent = self.training
-        if compute_regularizers is None:
-            compute_regularizers = labels is not None
-        hidden, encoder_subject_features = self.encoder(x, adjacency)
-        static_fc_embedding, _ = self.static_fc_encoder(x)
+
+        hidden = self.encoder(x)
         power_z, power_mean, power_logvar = self.power_posterior(
             hidden, sample=sample_latent
         )
-        fc_z, fc_mean, fc_logvar = self.fc_posterior(hidden, sample=sample_latent)
+        fc_z, fc_mean, fc_logvar = self.fc_posterior(
+            hidden, sample=sample_latent
+        )
 
-        power_for_nll = F.softmax(power_z / self.coefficient_temperature, dim=-1)
-        fc_for_nll = F.softmax(fc_z / self.coefficient_temperature, dim=-1)
-        power_coefficients = F.softmax(
-            power_mean / self.coefficient_temperature, dim=-1
-        )
-        fc_coefficients = F.softmax(fc_mean / self.coefficient_temperature, dim=-1)
-        dynamic_features = self.classification_features(
-            power_coefficients, fc_coefficients
-        )
-        feature_options = {
-            "fused": torch.cat(
-                [dynamic_features, encoder_subject_features, static_fc_embedding], dim=-1
-            ),
-            "modes-only": dynamic_features,
-            "encoder-only": encoder_subject_features,
-            "static-only": static_fc_embedding,
-        }
-        logits = self.classifier(feature_options[self.classifier_input])
-        mode_logits = self.mode_classifier(dynamic_features)
+        # Sampled logits are used for the Monte-Carlo generative path.
+        alpha_sample, beta_sample = self.mode_weights(power_z, fc_z)
+        # Posterior means give deterministic trajectories for prediction/reporting.
+        alpha_mean, beta_mean = self.mode_weights(power_mean, fc_mean)
+
+        subject_representation = self._trajectory_summary(power_mean, fc_mean)
+        logits = self.classifier(subject_representation)
 
         nll = (
-            self.gaussian_nll(
-                x, power_for_nll, fc_for_nll, n_time_samples=nll_time_samples
+            self._negative_log_likelihood(
+                x, alpha_sample, beta_sample, chunk_size=nll_chunk_size
             )
             if compute_nll
             else None
         )
-        kl = None
-        kl_raw = None
-        classification_loss = None
-        mode_classification_loss = None
-        if labels is not None:
-            power_prior_mean, power_prior_logvar = self.power_prior(
-                power_z.detach(), labels
-            )
-            fc_prior_mean, fc_prior_logvar = self.fc_prior(fc_z.detach(), labels)
-            kl_raw = gaussian_kl(
-                power_mean, power_logvar, power_prior_mean, power_prior_logvar
-            ) + gaussian_kl(fc_mean, fc_logvar, fc_prior_mean, fc_prior_logvar)
-            kl = gaussian_kl(
-                power_mean,
-                power_logvar,
-                power_prior_mean,
-                power_prior_logvar,
-                self.free_bits,
-            ) + gaussian_kl(
-                fc_mean,
-                fc_logvar,
-                fc_prior_mean,
-                fc_prior_logvar,
-                self.free_bits,
-            )
-            classification_loss = F.cross_entropy(
-                logits, labels, weight=class_weights
-            )
-            mode_classification_loss = F.cross_entropy(
-                mode_logits, labels, weight=class_weights
-            )
 
-        if compute_regularizers:
-            prior_separation = self.prior_separation_penalty()
-            mode_diversity = self.mode_diversity_penalty()
-            mode_entropy, mode_balance = self.occupancy_regularizers(
-                power_coefficients, fc_coefficients
+        kl = None
+        classification_loss = None
+        prior_outputs = (None, None, None, None)
+        if labels is not None:
+            prior_outputs = self.prior(power_z, fc_z, labels)
+            p_power_mean, p_power_logvar, p_fc_mean, p_fc_logvar = prior_outputs
+            kl_power = diagonal_gaussian_kl(
+                power_mean, power_logvar, p_power_mean, p_power_logvar
             )
-        else:
-            prior_separation = None
-            mode_diversity = None
-            mode_entropy = None
-            mode_balance = None
+            kl_fc = diagonal_gaussian_kl(
+                fc_mean, fc_logvar, p_fc_mean, p_fc_logvar
+            )
+            # Mean over subjects/time and normalize by joint latent dimensionality.
+            kl = (kl_power + kl_fc).mean() / (
+                self.n_power_modes + self.n_fc_modes
+            )
+            classification_loss = F.cross_entropy(logits, labels.long())
+
         return {
             "logits": logits,
-            "mode_logits": mode_logits,
             "nll": nll,
             "kl": kl,
-            "kl_raw": kl_raw,
             "classification_loss": classification_loss,
-            "mode_classification_loss": mode_classification_loss,
-            "prior_separation": prior_separation,
-            "mode_diversity": mode_diversity,
-            "mode_entropy": mode_entropy,
-            "mode_balance": mode_balance,
-            "power_coefficients": power_coefficients,
-            "fc_coefficients": fc_coefficients,
+            "power_sample": power_z,
+            "fc_sample": fc_z,
             "power_mean": power_mean,
+            "power_logvar": power_logvar,
             "fc_mean": fc_mean,
-            "classifier_features": dynamic_features,
-            "encoder_subject_features": encoder_subject_features,
-            "static_fc_embedding": static_fc_embedding,
+            "fc_logvar": fc_logvar,
+            "power_coefficients": alpha_mean,
+            "fc_coefficients": beta_mean,
+            "power_coefficients_sampled": alpha_sample,
+            "fc_coefficients_sampled": beta_sample,
+            "subject_representation": subject_representation,
+            "prior_power_mean": prior_outputs[0],
+            "prior_power_logvar": prior_outputs[1],
+            "prior_fc_mean": prior_outputs[2],
+            "prior_fc_logvar": prior_outputs[3],
         }
 
     @staticmethod
     def total_loss(
         outputs: Dict[str, Optional[torch.Tensor]],
-        epoch: int,
-        nll_weight: float,
-        kl_max_weight: float,
-        classification_weight: float,
-        mode_classification_weight: float,
-        classification_warmup_epochs: int,
-        generative_ramp_epochs: int,
-        prior_separation_weight: float,
-        mode_diversity_weight: float,
-        occupancy_entropy_weight: float,
-        occupancy_balance_weight: float,
-    ):
-        required = (
-            "classification_loss",
-            "mode_classification_loss",
-            "prior_separation",
-            "mode_diversity",
-            "mode_entropy",
-            "mode_balance",
+        lambda_kl: float,
+        gamma_cls: float,
+    ) -> torch.Tensor:
+        """Manuscript Eq. (21): -L_ll + lambda_kl L_kl + gamma_cls L_cls."""
+        if outputs["nll"] is None:
+            raise ValueError("Training loss requires the Gaussian NLL.")
+        if outputs["kl"] is None or outputs["classification_loss"] is None:
+            raise ValueError("Training loss requires labels for KL and classification.")
+        return (
+            outputs["nll"]
+            + float(lambda_kl) * outputs["kl"]
+            + float(gamma_cls) * outputs["classification_loss"]
         )
-        missing = [name for name in required if outputs[name] is None]
-        if missing:
-            raise ValueError(
-                "Training loss requires labels and regularizers; missing "
-                + ", ".join(missing)
-            )
-        if epoch <= classification_warmup_epochs:
-            generative_fraction = 0.0
-        else:
-            generative_fraction = min(
-                1.0,
-                (epoch - classification_warmup_epochs)
-                / max(generative_ramp_epochs, 1),
-            )
-        effective_nll = nll_weight * generative_fraction
-        effective_kl = kl_max_weight * generative_fraction
-        if effective_nll > 0.0 and outputs["nll"] is None:
-            raise ValueError("A positive effective NLL weight requires an NLL value.")
-        if effective_kl > 0.0 and outputs["kl"] is None:
-            raise ValueError("A positive effective KL weight requires a KL value.")
-
-        zero = outputs["classification_loss"].new_zeros(())
-        total = (
-            classification_weight * outputs["classification_loss"]
-            + mode_classification_weight * outputs["mode_classification_loss"]
-            + effective_nll * (outputs["nll"] if outputs["nll"] is not None else zero)
-            + effective_kl * (outputs["kl"] if outputs["kl"] is not None else zero)
-            + prior_separation_weight
-            * generative_fraction
-            * outputs["prior_separation"]
-            + mode_diversity_weight * outputs["mode_diversity"]
-            + occupancy_entropy_weight * outputs["mode_entropy"]
-            + occupancy_balance_weight * outputs["mode_balance"]
-        )
-        weights = {
-            "generative_fraction": generative_fraction,
-            "nll_weight": effective_nll,
-            "kl_weight": effective_kl,
-            "prior_separation_weight": prior_separation_weight * generative_fraction,
-        }
-        return total, weights

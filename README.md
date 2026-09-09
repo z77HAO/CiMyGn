@@ -27,8 +27,7 @@ $$
 The training objective is
 
 $$
-\mathcal{L}
-=
+\mathcal{L} =
 -\mathcal{L}_{ll}
 +\lambda_{kl}\mathcal{L}_{kl}
 +\gamma_{cls}\mathcal{L}_{cls},

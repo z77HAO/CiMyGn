@@ -73,3 +73,8 @@ A Conda environment can be created using:
 ```bash
 conda env create -f environment_cimygn_windows.yml
 conda activate cimygn
+
+Alternatively:
+```bash
+pip install -r requirements_cimygn.txt
+

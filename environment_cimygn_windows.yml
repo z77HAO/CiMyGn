@@ -1,0 +1,14 @@
+name: cimygn
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy=1.26.*
+  - scipy>=1.11
+  - pandas>=2.0
+  - scikit-learn>=1.3
+  - h5py>=3.9
+  - pip>=23
+  - pip:
+      - torch>=2.2
+
